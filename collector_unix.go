@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"os/user"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 )
@@ -33,7 +34,7 @@ var runtimeGOOS = func() string { return goos }
 func parseLsof(data string) []PortEntry {
 	var entries []PortEntry
 	seen := make(map[string]struct{})
-	var command, user string
+	var command, user, protocol string
 	pid := 0
 	for _, line := range strings.Split(data, "\n") {
 		if line == "" {
@@ -46,9 +47,11 @@ func parseLsof(data string) []PortEntry {
 			command = line[1:]
 		case 'u':
 			user = resolveUser(line[1:])
+		case 'P':
+			protocol = normalizeProtocol(line[1:])
 		case 'n':
-			protocol, port, ok := parseSocketName(line[1:])
-			if ok {
+			port, ok := parseSocketName(line[1:])
+			if ok && (protocol == "TCP" || protocol == "UDP") {
 				entry := PortEntry{protocol, port, pid, command, user}
 				key := fmt.Sprintf("%s/%d/%d", protocol, port, pid)
 				if _, exists := seen[key]; !exists {
@@ -68,22 +71,18 @@ func resolveUser(value string) string {
 	return value
 }
 
-func parseSocketName(name string) (string, int, bool) {
+func parseSocketName(name string) (int, bool) {
 	if strings.Contains(name, "->") {
-		return "", 0, false
-	}
-	protocol := "TCP"
-	if strings.HasPrefix(name, "UDP") {
-		protocol = "UDP"
+		return 0, false
 	}
 	if i := strings.LastIndex(name, ":"); i >= 0 {
 		portText := strings.TrimSpace(strings.TrimSuffix(name[i+1:], " (LISTEN)"))
 		port, err := strconv.Atoi(portText)
 		if err == nil {
-			return protocol, port, true
+			return port, true
 		}
 	}
-	return "", 0, false
+	return 0, false
 }
 
 func collectLinux(ctx context.Context) ([]PortEntry, []string, error) {
@@ -110,23 +109,24 @@ func parseSS(data string) []PortEntry {
 		if err != nil {
 			continue
 		}
-		pid, process := 0, ""
-		for _, field := range f[5:] {
-			if strings.HasPrefix(field, "users:(('") {
-				parts := strings.Split(field, ",")
-				if len(parts) > 1 {
-					process = strings.Trim(parts[0][9:], "'\"")
-				}
-				for _, p := range parts {
-					if strings.HasPrefix(p, "pid=") {
-						pid, _ = strconv.Atoi(strings.Trim(p[4:], "))"))
-					}
-				}
-			}
-		}
+		pid, process := parseSSProcess(s.Text())
 		entries = append(entries, PortEntry{protocol, port, pid, process, userForPID(pid)})
 	}
 	return entries
+}
+
+var ssProcessPattern = regexp.MustCompile(`users:\(\(\"([^\"]+)\",pid=(\d+)`)
+
+func parseSSProcess(line string) (int, string) {
+	match := ssProcessPattern.FindStringSubmatch(line)
+	if len(match) != 3 {
+		return 0, ""
+	}
+	pid, err := strconv.Atoi(match[2])
+	if err != nil {
+		return 0, match[1]
+	}
+	return pid, match[1]
 }
 
 func userForPID(pid int) string {
